@@ -91,6 +91,36 @@ docker compose build && docker compose up -d
 ./verify.sh
 ```
 
+## Live sinds 1 november 2026 (gemeten)
+
+Ingelogd via `https://analytics.studiovanderheide.nl/authorize` (redirect naar
+`/dashboard/`, geen SSH-tunnel nodig; helper: `/home/hermes/apps/oauth-login-url.py`).
+Het token staat in het volume: `tokens.json` (839 bytes, appuser, mode 600) — een
+containerherstart behoudt de sessie, bevestigd door na de herstart opnieuw te queryen.
+
+Vergelijking eigen service vs. de oude aggregator, periode 30-09 t/m 29-10-2026:
+
+| Bron | Eigen service | Oude aggregator |
+|---|---|---|
+| Search Console | `white vision` 32 kliks / 851 vert. / CTR 0,0376 / pos. 3,3067 | identiek |
+| GA4 (bronnen) | google 599, (direct) 456, ads.google.com 16 — 16 bronnen | identiek |
+| Google Ads | €333,55 · 347 klikken · 9.027 vertoningen over 6 campagnes | identiek |
+
+Onderweg gevonden en gefixt (allemaal met een test erbij): de advertentierespons komt als
+één JSON-array (niet als NDJSON, dus niet regel-voor-regel parsen); Google-REST gebruikt
+camelCase (`metrics.costMicros`), dus GAQL-paden moeten vertaald worden; en niet-metrics
+mogen nooit door een getalparser (campagnenamen werden `null`).
+
+### Keyword Planner: geblokkeerd door Google
+
+`generateKeywordIdeas` geeft `403 DEVELOPER_TOKEN_NOT_APPROVED`: *"This method is not allowed
+for use with explorer access. Please apply for basic or standard access."* De service vertaalt
+dat nu naar één begrijpelijke regel. Zolang het Cloud-project op **Explorer** staat kan
+Adlytica's tab **Keyword Search → ideeën** (volume, competitie, biedranges) dus niet via deze
+service; de oude aggregator kon het wel omdat die zijn eigen goedgekeurde token heeft. Oplossing:
+Basic- of Standard-access aanvragen (brand verification) op de Google Ads API-pagina van het
+project. Alle andere Ads-lees- en schrijfoperaties werken wel.
+
 ## Openstaand
 
 - **Nog niet end-to-end getest**: GA4/GSC/Ads-calls naar de echte API's wachten op stap 1–3.

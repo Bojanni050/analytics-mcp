@@ -82,7 +82,14 @@ func (c *Client) postJSON(ctx context.Context, url string, headers map[string]st
 		return fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("google api %s returned HTTP %d: %s", endpointName(url), resp.StatusCode, truncate(string(raw), 900))
+		body := string(raw)
+		// Explorer-access staat de Keyword Planner-methodes niet toe; dat is een
+		// projectinstelling, geen fout in de query.
+		if strings.Contains(body, "DEVELOPER_TOKEN_NOT_APPROVED") || strings.Contains(body, "explorer access") {
+			return fmt.Errorf("google api %s: deze methode is niet beschikbaar met Explorer-access — "+
+				"vraag Basic- of Standard-access aan op de Google Ads API-pagina van het Cloud-project", endpointName(url))
+		}
+		return fmt.Errorf("google api %s returned HTTP %d: %s", endpointName(url), resp.StatusCode, truncate(body, 900))
 	}
 	if out == nil {
 		return nil

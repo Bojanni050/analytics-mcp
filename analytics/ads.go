@@ -1,7 +1,6 @@
 package analytics
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -113,43 +112,9 @@ func (c *Client) AdsQueryWithQuery(ctx context.Context, customerID string, field
 		return nil, "", fmt.Errorf("google_ads: %q komt uit de Keyword Planner; geef options.keyword_seeds mee in plaats van dit als rapportveld", f)
 	}
 
-	resource := ""
-	selects := make([]string, 0, len(requested))
-	paths := make(map[string]string, len(requested))
-	for _, f := range requested {
-		api, ok := adsFields[f]
-		if !ok {
-			return nil, "", fmt.Errorf("google_ads: onbekend veld %q", f)
-		}
-		paths[f] = api
-		selects = append(selects, api)
-		if resource == "" {
-			resource = adsResources[api]
-		} else if r, ok := adsResources[api]; ok && r != resource {
-			// keyword_view and search_term_view both carry campaign metrics; in
-			// that case the more specific resource wins.
-			if resource == "campaign" {
-				resource = r
-			}
-		}
-	}
-	if resource == "" {
-		resource = "campaign"
-	}
-
-	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selects, ", "), resource)
-	if len(conditions) > 0 {
-		query += " WHERE " + strings.Join(conditions, " AND ")
-	}
-	if len(orderings) > 0 {
-		query += " ORDER BY " + strings.Join(orderings, ", ")
-	}
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
-	}
-	if resource == "campaign" && !containsDateCondition(conditions) && hasMetrics(selects) {
-		// Ads requires a finite date range as soon as metrics are selected.
-		query += " AND segments.date DURING LAST_30_DAYS"
+	query, paths, err := buildAdsQuery(requested, conditions, orderings, limit)
+	if err != nil {
+		return nil, "", err
 	}
 
 	rows, err := c.adsSearch(ctx, customerID, query, loginCustomerID)
@@ -161,7 +126,7 @@ func (c *Client) AdsQueryWithQuery(ctx context.Context, customerID string, field
 	for _, raw := range rows {
 		row := map[string]any{}
 		for field, path := range paths {
-			row[field] = convertAdsValue(path, getPath(raw, path))
+			row[field] = convertAdsValue(path, getAdsPath(raw, path))
 		}
 		out = append(out, row)
 	}
@@ -188,6 +153,54 @@ func keywordPlanField(fields []string) string {
 		}
 	}
 	return ""
+}
+
+// buildAdsQuery turns requested fields plus conditions into GAQL and returns
+// the field -> API path map used to read the result rows. Pure function so the
+// query shape is unit-testable.
+func buildAdsQuery(requested, conditions, orderings []string, limit int) (string, map[string]string, error) {
+	resource := ""
+	selects := make([]string, 0, len(requested))
+	paths := make(map[string]string, len(requested))
+	for _, f := range requested {
+		api, ok := adsFields[f]
+		if !ok {
+			return "", nil, fmt.Errorf("google_ads: onbekend veld %q", f)
+		}
+		paths[f] = api
+		selects = append(selects, api)
+		if resource == "" {
+			resource = adsResources[api]
+		} else if r, ok := adsResources[api]; ok && r != resource {
+			// keyword_view and search_term_view also carry campaign metrics; the
+			// more specific resource wins in that case.
+			if resource == "campaign" {
+				resource = r
+			}
+		}
+	}
+	if resource == "" {
+		resource = "campaign"
+	}
+
+	conditions = append([]string{}, conditions...)
+	if resource == "campaign" && !containsDateCondition(conditions) && hasMetrics(selects) {
+		// Ads weigert metrics zonder eindige periode; de conditie moet vóór
+		// ORDER BY/LIMIT staan, anders is de GAQL ongeldig.
+		conditions = append(conditions, "segments.date DURING LAST_30_DAYS")
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selects, ", "), resource)
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	if len(orderings) > 0 {
+		query += " ORDER BY " + strings.Join(orderings, ", ")
+	}
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	return query, paths, nil
 }
 
 func containsDateCondition(conditions []string) bool {
@@ -236,49 +249,105 @@ func (c *Client) adsSearch(ctx context.Context, customerID, query string, loginC
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("google ads returned HTTP %d: %s", resp.StatusCode, truncate(string(raw), 900))
+		body := string(raw)
+		if strings.Contains(body, "DEVELOPER_TOKEN_NOT_APPROVED") || strings.Contains(body, "explorer access") {
+			return nil, fmt.Errorf("google ads: deze methode (Keyword Planner) is niet beschikbaar met Explorer-access — " +
+				"vraag Basic- of Standard-access aan op de Google Ads API-pagina van het Cloud-project")
+		}
+		return nil, fmt.Errorf("google ads returned HTTP %d: %s", resp.StatusCode, truncate(body, 900))
+	}
+
+	return parseAdsStream(raw)
+}
+
+// adsStreamChunk is one element of a googleAds:searchStream response.
+type adsStreamChunk struct {
+	Results []map[string]any `json:"results"`
+	Error   *struct {
+		Message string `json:"message"`
+		Status  string `json:"status"`
+	} `json:"error"`
+}
+
+// parseAdsStream accepts both shapes the API can return: a single JSON array
+// (optionally pretty-printed, so never parse line by line) and a stream of
+// newline-delimited objects.
+func parseAdsStream(raw []byte) ([]map[string]any, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, nil
 	}
 
 	var rows []map[string]any
-	scanner := bufio.NewScanner(bytes.NewReader(raw))
-	scanner.Buffer(make([]byte, 0, 1<<20), 32<<20)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		// searchStream can also answer as a single JSON array.
-		if strings.HasPrefix(line, "[") {
-			var chunk []struct {
-				Results []map[string]any `json:"results"`
+	collect := func(chunks []adsStreamChunk) error {
+		for _, chunk := range chunks {
+			if chunk.Error != nil {
+				return fmt.Errorf("google ads error: %s (%s)", chunk.Error.Message, chunk.Error.Status)
 			}
-			if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-				return nil, fmt.Errorf("decode google ads response: %w", err)
-			}
-			for _, c := range chunk {
-				rows = append(rows, c.Results...)
-			}
-			continue
+			rows = append(rows, chunk.Results...)
 		}
-		var chunk struct {
-			Results []map[string]any `json:"results"`
-			Error   *struct {
-				Message string `json:"message"`
-				Status  string `json:"status"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+		return nil
+	}
+
+	if trimmed[0] == '[' {
+		var chunks []adsStreamChunk
+		if err := json.Unmarshal(trimmed, &chunks); err != nil {
 			return nil, fmt.Errorf("decode google ads response: %w", err)
 		}
-		if chunk.Error != nil {
-			return nil, fmt.Errorf("google ads error: %s (%s)", chunk.Error.Message, chunk.Error.Status)
+		if err := collect(chunks); err != nil {
+			return nil, err
 		}
-		rows = append(rows, chunk.Results...)
+		return rows, nil
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
+
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	for {
+		var chunk adsStreamChunk
+		err := dec.Decode(&chunk)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("decode google ads response: %w", err)
+		}
+		if err := collect([]adsStreamChunk{chunk}); err != nil {
+			return nil, err
+		}
 	}
 	return rows, nil
+}
+
+// toCamelPath converts a GAQL path to the camelCase form Google's REST JSON
+// uses: metrics.cost_micros -> metrics.costMicros, ad_group_criterion.keyword.text
+// -> adGroupCriterion.keyword.text.
+func toCamelPath(path string) string {
+	parts := strings.Split(path, ".")
+	for i, part := range parts {
+		if !strings.Contains(part, "_") {
+			continue
+		}
+		segs := strings.Split(part, "_")
+		out := segs[0]
+		for _, seg := range segs[1:] {
+			if seg == "" {
+				continue
+			}
+			out += strings.ToUpper(seg[:1]) + seg[1:]
+		}
+		parts[i] = out
+	}
+	return strings.Join(parts, ".")
+}
+
+// getAdsPath reads a field out of a decoded Ads row, accepting both the GAQL
+// spelling and the camelCase JSON spelling.
+func getAdsPath(obj map[string]any, path string) any {
+	if camel := toCamelPath(path); camel != path {
+		if v := getPath(obj, camel); v != nil {
+			return v
+		}
+	}
+	return getPath(obj, path)
 }
 
 // getPath reads a dotted path out of a decoded JSON object.
@@ -309,7 +378,9 @@ var adsMicrosPaths = map[string]bool{
 }
 
 // convertAdsValue turns API values into the shape the app expects: micros to
-// whole units, numeric strings to numbers, enums left as strings.
+// whole units, metric numbers to numbers, everything else (names, keyword texts,
+// enums, ids, dates) left untouched. Running every value through a number parser
+// silently turned campaign names and search terms into null.
 func convertAdsValue(path string, value any) any {
 	if value == nil {
 		return nil
@@ -317,15 +388,10 @@ func convertAdsValue(path string, value any) any {
 	if strings.HasSuffix(path, "_micros") || adsMicrosPaths[path] {
 		return micros(value)
 	}
-	switch path {
-	case "campaign.status", "ad_group.status", "segments.device",
-		"ad_group_criterion.keyword.match_type",
-		"ad_group_criterion.quality_info.quality_score":
-		return value
-	case "campaign.id", "ad_group.id", "ad_group_criterion.criterion_id", "segments.date":
-		return value
+	if strings.HasPrefix(path, "metrics.") {
+		return num(value)
 	}
-	return num(value)
+	return value
 }
 
 // SetCampaignStatus pauses or enables one campaign.
