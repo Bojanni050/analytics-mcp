@@ -16,33 +16,34 @@ const adsBaseURL = "https://googleads.googleapis.com/v25"
 
 // adsFields maps the field names the app asks for onto Google Ads API fields.
 var adsFields = map[string]string{
-	"campaign_id":         "campaign.id",
-	"campaign_name":       "campaign.name",
-	"campaign_status":     "campaign.status",
-	"status":              "campaign.status",
-	"campaign_budget":     "campaign_budget.amount_micros",
-	"daily_budget":        "campaign_budget.amount_micros",
-	"ad_group_id":         "ad_group.id",
-	"ad_group_name":       "ad_group.name",
-	"ad_group_status":     "ad_group.status",
-	"keyword_id":          "ad_group_criterion.criterion_id",
-	"keyword_text":        "ad_group_criterion.keyword.text",
-	"keyword":             "ad_group_criterion.keyword.text",
-	"match_type":          "ad_group_criterion.keyword.match_type",
-	"quality_score":       "ad_group_criterion.quality_info.quality_score",
-	"search_term":         "search_term_view.search_term",
-	"query":               "search_term_view.search_term",
-	"date":                "segments.date",
-	"device":              "segments.device",
-	"clicks":              "metrics.clicks",
-	"impressions":         "metrics.impressions",
-	"ctr":                 "metrics.ctr",
-	"conversions":         "metrics.conversions",
-	"conversions_value":   "metrics.conversions_value",
-	"cost":                "metrics.cost_micros",
-	"spend":               "metrics.cost_micros",
-	"average_cpc":         "metrics.average_cpc",
-	"cost_per_conversion": "metrics.cost_per_conversion",
+	"campaign_id":          "campaign.id",
+	"campaign_name":        "campaign.name",
+	"campaign_status":      "campaign.status",
+	"status":               "campaign.status",
+	"campaign_budget":      "campaign_budget.amount_micros",
+	"daily_budget":         "campaign_budget.amount_micros",
+	"campaign_budget_type": "campaign_budget.period",
+	"ad_group_id":          "ad_group.id",
+	"ad_group_name":        "ad_group.name",
+	"ad_group_status":      "ad_group.status",
+	"keyword_id":           "ad_group_criterion.criterion_id",
+	"keyword_text":         "ad_group_criterion.keyword.text",
+	"keyword":              "ad_group_criterion.keyword.text",
+	"match_type":           "ad_group_criterion.keyword.match_type",
+	"quality_score":        "ad_group_criterion.quality_info.quality_score",
+	"search_term":          "search_term_view.search_term",
+	"query":                "search_term_view.search_term",
+	"date":                 "segments.date",
+	"device":               "segments.device",
+	"clicks":               "metrics.clicks",
+	"impressions":          "metrics.impressions",
+	"ctr":                  "metrics.ctr",
+	"conversions":          "metrics.conversions",
+	"conversions_value":    "metrics.conversions_value",
+	"cost":                 "metrics.cost_micros",
+	"spend":                "metrics.cost_micros",
+	"average_cpc":          "metrics.average_cpc",
+	"cost_per_conversion":  "metrics.cost_per_conversion",
 }
 
 // adsResources are the FROM resources we support, keyed by the resource the
@@ -108,6 +109,9 @@ func (c *Client) AdsQueryWithQuery(ctx context.Context, customerID string, field
 	if len(requested) == 0 {
 		return nil, "", fmt.Errorf("google_ads: at least one field is required")
 	}
+	if f := keywordPlanField(requested); f != "" {
+		return nil, "", fmt.Errorf("google_ads: %q komt uit de Keyword Planner; geef options.keyword_seeds mee in plaats van dit als rapportveld", f)
+	}
 
 	resource := ""
 	selects := make([]string, 0, len(requested))
@@ -162,6 +166,28 @@ func (c *Client) AdsQueryWithQuery(ctx context.Context, customerID string, field
 		out = append(out, row)
 	}
 	return out, query, nil
+}
+
+// adsKeywordPlanFields are the Keywords Planner metrics. They exist only in the
+// KeywordPlanIdeaService, so asking for them without options.keyword_seeds is a
+// caller error worth naming precisely.
+var adsKeywordPlanFields = map[string]bool{
+	"avg_monthly_searches":  true,
+	"monthly_search_volume": true,
+	"monthly_searches":      true,
+	"competition":           true,
+	"competition_index":     true,
+	"low_top_of_page_bid":   true,
+	"high_top_of_page_bid":  true,
+}
+
+func keywordPlanField(fields []string) string {
+	for _, f := range fields {
+		if adsKeywordPlanFields[f] {
+			return f
+		}
+	}
+	return ""
 }
 
 func containsDateCondition(conditions []string) bool {
@@ -327,39 +353,65 @@ func (c *Client) SetCampaignStatus(ctx context.Context, customerID, campaignID, 
 	return c.postJSON(ctx, u, adsHeaders(loginCustomerID), body, nil)
 }
 
-// PushNegativeKeywords adds negative keywords to one campaign. matchType is
-// BROAD, PHRASE or EXACT.
-func (c *Client) PushNegativeKeywords(ctx context.Context, customerID, campaignID string, keywords []string, matchType, loginCustomerID string) (int, error) {
+// NegativeKeyword is one negative keyword, optionally with its own match type.
+type NegativeKeyword struct {
+	Text      string
+	MatchType string
+}
+
+// adsMatchType normalises a match type; empty means BROAD, an unknown value
+// returns "" so the caller can report it.
+func adsMatchType(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "", "BROAD":
+		return "BROAD"
+	case "PHRASE":
+		return "PHRASE"
+	case "EXACT":
+		return "EXACT"
+	}
+	return ""
+}
+
+// PushNegativeKeywords adds negative keywords to one campaign. Only campaign
+// level is supported; a per-keyword match type wins over the default.
+func (c *Client) PushNegativeKeywords(ctx context.Context, customerID, campaignID, level string, keywords []NegativeKeyword, defaultMatchType, loginCustomerID string) (int, error) {
 	customerID = normaliseCustomerID(customerID)
 	campaignID = strings.TrimSpace(campaignID)
 	if customerID == "" || campaignID == "" {
 		return 0, fmt.Errorf("google_ads: customer id and campaign id are required")
 	}
-	matchType = strings.ToUpper(strings.TrimSpace(matchType))
-	switch matchType {
-	case "", "BROAD":
-		matchType = "BROAD"
-	case "PHRASE", "EXACT":
-	default:
-		return 0, fmt.Errorf("google_ads: matchType must be BROAD, PHRASE or EXACT, got %q", matchType)
+	if lvl := strings.ToLower(strings.TrimSpace(level)); lvl != "" && lvl != "campaign" {
+		return 0, fmt.Errorf("google_ads: alleen level \"campaign\" wordt ondersteund, kreeg %q", level)
+	}
+	fallback := adsMatchType(defaultMatchType)
+	if fallback == "" {
+		return 0, fmt.Errorf("google_ads: matchType must be BROAD, PHRASE or EXACT, got %q", defaultMatchType)
 	}
 
 	operations := make([]map[string]any, 0, len(keywords))
 	for _, keyword := range keywords {
-		keyword = strings.TrimSpace(keyword)
-		if keyword == "" {
+		text := strings.TrimSpace(keyword.Text)
+		if text == "" {
 			continue
+		}
+		matchType := fallback
+		if strings.TrimSpace(keyword.MatchType) != "" {
+			matchType = adsMatchType(keyword.MatchType)
+			if matchType == "" {
+				return 0, fmt.Errorf("google_ads: onbekend match_type %q bij %q", keyword.MatchType, text)
+			}
 		}
 		operations = append(operations, map[string]any{
 			"create": map[string]any{
 				"campaign": fmt.Sprintf("customers/%s/campaigns/%s", customerID, campaignID),
 				"negative": true,
-				"keyword":  map[string]any{"text": keyword, "matchType": matchType},
+				"keyword":  map[string]any{"text": text, "matchType": matchType},
 			},
 		})
 	}
 	if len(operations) == 0 {
-		return 0, fmt.Errorf("google_ads: no keywords given")
+		return 0, fmt.Errorf("google_ads: geen (niet-lege) negative keywords ontvangen")
 	}
 
 	body := map[string]any{"operations": operations}
@@ -368,6 +420,149 @@ func (c *Client) PushNegativeKeywords(ctx context.Context, customerID, campaignI
 		return 0, err
 	}
 	return len(operations), nil
+}
+
+// CreateCampaign creates a search or display campaign with its own budget and
+// returns the new campaign id.
+func (c *Client) CreateCampaign(ctx context.Context, customerID, name, channelType, bidding string, budgetMicros int64, status, loginCustomerID string) (string, error) {
+	customerID = normaliseCustomerID(customerID)
+	name = strings.TrimSpace(name)
+	if customerID == "" || name == "" {
+		return "", fmt.Errorf("google_ads: customer id en name zijn verplicht")
+	}
+	if budgetMicros <= 0 {
+		return "", fmt.Errorf("google_ads: budget_amount_micros moet groter dan 0 zijn")
+	}
+	status = strings.ToUpper(strings.TrimSpace(status))
+	switch status {
+	case "":
+		status = "PAUSED"
+	case "PAUSED", "ENABLED":
+	default:
+		return "", fmt.Errorf("google_ads: status moet PAUSED of ENABLED zijn, kreeg %q", status)
+	}
+
+	// Een campagne zonder eigen budget bestaat niet: eerst het budget aanmaken.
+	var budgetResp struct {
+		Results []struct {
+			ResourceName string `json:"resourceName"`
+		} `json:"results"`
+	}
+	u := fmt.Sprintf("%s/customers/%s/campaignBudgets:mutate", adsBaseURL, customerID)
+	budgetBody := map[string]any{"operations": []map[string]any{{"create": map[string]any{
+		"name":             name + " budget",
+		"amountMicros":     fmt.Sprintf("%d", budgetMicros),
+		"deliveryMethod":   "STANDARD",
+		"explicitlyShared": false,
+	}}}}
+	if err := c.postJSON(ctx, u, adsHeaders(loginCustomerID), budgetBody, &budgetResp); err != nil {
+		return "", err
+	}
+	if len(budgetResp.Results) == 0 {
+		return "", fmt.Errorf("google_ads: geen budget-resource teruggekregen")
+	}
+
+	campaign := map[string]any{
+		"name":                   name,
+		"advertisingChannelType": adsChannelType(channelType),
+		"status":                 status,
+		"campaignBudget":         budgetResp.Results[0].ResourceName,
+	}
+	switch strings.ToLower(strings.TrimSpace(bidding)) {
+	case "", "manual_cpc":
+		campaign["manualCpc"] = map[string]any{"enhancedCpcEnabled": true}
+	case "maximize_conversions":
+		campaign["maximizeConversions"] = map[string]any{}
+	case "target_spend":
+		campaign["targetSpend"] = map[string]any{}
+	default:
+		return "", fmt.Errorf("google_ads: onbekende bidding_strategy %q", bidding)
+	}
+
+	var resp struct {
+		Results []struct {
+			ResourceName string `json:"resourceName"`
+		} `json:"results"`
+	}
+	u = fmt.Sprintf("%s/customers/%s/campaigns:mutate", adsBaseURL, customerID)
+	if err := c.postJSON(ctx, u, adsHeaders(loginCustomerID), map[string]any{
+		"operations": []map[string]any{{"create": campaign}},
+	}, &resp); err != nil {
+		return "", err
+	}
+	if len(resp.Results) == 0 {
+		return "", fmt.Errorf("google_ads: geen campagne-resource teruggekregen")
+	}
+	return lastSegment(resp.Results[0].ResourceName), nil
+}
+
+// CreateAdGroup creates a paused or active ad group in an existing campaign.
+func (c *Client) CreateAdGroup(ctx context.Context, customerID, campaignID, name string, cpcBidMicros int64, status, loginCustomerID string) (string, error) {
+	customerID = normaliseCustomerID(customerID)
+	campaignID = strings.TrimSpace(campaignID)
+	name = strings.TrimSpace(name)
+	if customerID == "" || campaignID == "" || name == "" {
+		return "", fmt.Errorf("google_ads: customer id, campaign id en name zijn verplicht")
+	}
+	status = strings.ToUpper(strings.TrimSpace(status))
+	switch status {
+	case "":
+		status = "PAUSED"
+	case "PAUSED", "ENABLED":
+	default:
+		return "", fmt.Errorf("google_ads: status moet PAUSED of ENABLED zijn, kreeg %q", status)
+	}
+
+	adGroup := map[string]any{
+		"campaign": fmt.Sprintf("customers/%s/campaigns/%s", customerID, campaignID),
+		"name":     name,
+		"status":   status,
+	}
+	if cpcBidMicros > 0 {
+		adGroup["cpcBidMicros"] = fmt.Sprintf("%d", cpcBidMicros)
+	}
+
+	var resp struct {
+		Results []struct {
+			ResourceName string `json:"resourceName"`
+		} `json:"results"`
+	}
+	u := fmt.Sprintf("%s/customers/%s/adGroups:mutate", adsBaseURL, customerID)
+	if err := c.postJSON(ctx, u, adsHeaders(loginCustomerID), map[string]any{
+		"operations": []map[string]any{{"create": adGroup}},
+	}, &resp); err != nil {
+		return "", err
+	}
+	if len(resp.Results) == 0 {
+		return "", fmt.Errorf("google_ads: geen ad group-resource teruggekregen")
+	}
+	return lastSegment(resp.Results[0].ResourceName), nil
+}
+
+// adsChannelType maps the app's channel names onto Ads API enum values.
+func adsChannelType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "search":
+		return "SEARCH"
+	case "display":
+		return "DISPLAY"
+	case "video":
+		return "VIDEO"
+	case "performance_max", "pmax":
+		return "PERFORMANCE_MAX"
+	default:
+		return strings.ToUpper(strings.TrimSpace(value))
+	}
+}
+
+// lastSegment returns the id from a resource name like
+// "customers/3070436491/campaigns/24337488185".
+func lastSegment(resourceName string) string {
+	parts := strings.Split(strings.TrimSpace(resourceName), "/")
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[len(parts)-1]
 }
 
 // SetCampaignBudget sets the daily budget of one campaign's budget.

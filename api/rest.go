@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -62,16 +63,41 @@ type ActionRequest struct {
 	LoginCustomerID string         `json:"login_customer_id,omitempty"`
 }
 
-// ActionResponse reports what a write did.
+// ActionResponse reports what a write did. Newly created entities carry their
+// id so the caller can chain (campagne aanmaken → ad group aanmaken).
 type ActionResponse struct {
-	Status   string `json:"status"`
-	Action   string `json:"action"`
-	Affected int    `json:"affected"`
-	Message  string `json:"message,omitempty"`
+	Status     string `json:"status"`
+	Action     string `json:"action"`
+	Affected   int    `json:"affected"`
+	Message    string `json:"message,omitempty"`
+	CampaignID string `json:"campaign_id,omitempty"`
+	AdGroupID  string `json:"ad_group_id,omitempty"`
 }
 
 // SupportedConnectors are the connector ids this facade understands.
 var SupportedConnectors = []string{"googleanalytics4", "searchconsole", "google_ads"}
+
+// knownAdsActions are the write actions of the Google Ads connector. The
+// dashboard calls them by name, so a typo should fail fast with the list of
+// what does work instead of an opaque API error.
+var knownAdsActions = map[string]bool{
+	"pause_campaign":         true,
+	"enable_campaign":        true,
+	"push_negative_keywords": true,
+	"set_campaign_budget":    true,
+	"create_campaign":        true,
+	"create_ad_group":        true,
+}
+
+// sortedAdsActions lists the supported Google Ads actions for error messages.
+func sortedAdsActions() []string {
+	names := make([]string, 0, len(knownAdsActions))
+	for name := range knownAdsActions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
 
 // RunQuery executes a read request against the right Google API.
 func RunQuery(ctx context.Context, req QueryRequest) (QueryResponse, error) {
@@ -123,6 +149,10 @@ func RunAction(ctx context.Context, req ActionRequest) (ActionResponse, error) {
 	action := strings.ToLower(strings.TrimSpace(req.Action))
 	switch strings.ToLower(strings.TrimSpace(req.Connector)) {
 	case "google_ads", "ads", "":
+		if !knownAdsActions[action] {
+			return ActionResponse{}, fmt.Errorf("onbekende actie %q voor google_ads (kies uit: %s)",
+				req.Action, strings.Join(sortedAdsActions(), ", "))
+		}
 		switch action {
 		case "pause_campaign", "enable_campaign":
 			status := "PAUSED"
@@ -137,13 +167,47 @@ func RunAction(ctx context.Context, req ActionRequest) (ActionResponse, error) {
 
 		case "push_negative_keywords":
 			campaignID := stringParam(req.Params, "campaign_id", "campaignId")
-			keywords := stringListParam(req.Params, "keywords")
+			level := stringParam(req.Params, "level")
+			keywords := negativeKeywordsParam(req.Params)
 			matchType := stringParam(req.Params, "match_type", "matchType")
-			n, err := client.PushNegativeKeywords(ctx, req.Account, campaignID, keywords, matchType, req.LoginCustomerID)
+			n, err := client.PushNegativeKeywords(ctx, req.Account, campaignID, level, keywords, matchType, req.LoginCustomerID)
 			if err != nil {
 				return ActionResponse{}, err
 			}
 			return ActionResponse{Status: "ok", Action: action, Affected: n, Message: fmt.Sprintf("%d negative keywords toegevoegd", n)}, nil
+
+		case "create_campaign":
+			micros, err := amountMicrosParam(req.Params, "budget_amount_micros")
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			id, err := client.CreateCampaign(ctx, req.Account,
+				stringParam(req.Params, "name"),
+				stringParam(req.Params, "channel_type", "channelType"),
+				stringParam(req.Params, "bidding_strategy", "biddingStrategy"),
+				micros,
+				stringParam(req.Params, "status"),
+				req.LoginCustomerID)
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			return ActionResponse{Status: "ok", Action: action, Affected: 1, Message: "campagne " + id + " aangemaakt", CampaignID: id}, nil
+
+		case "create_ad_group":
+			micros, err := amountMicrosParam(req.Params, "cpc_bid_micros")
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			id, err := client.CreateAdGroup(ctx, req.Account,
+				stringParam(req.Params, "campaign_id", "campaignId"),
+				stringParam(req.Params, "name"),
+				micros,
+				stringParam(req.Params, "status"),
+				req.LoginCustomerID)
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			return ActionResponse{Status: "ok", Action: action, Affected: 1, Message: "ad group " + id + " aangemaakt", AdGroupID: id}, nil
 
 		case "set_campaign_budget":
 			budget := stringParam(req.Params, "budget_resource_name", "budgetResourceName")
@@ -176,6 +240,66 @@ func stringParam(params map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// negativeKeywordsParam accepts both shapes a client may send:
+// ["term", …] or [{"text": "term", "match_type": "BROAD"}, …].
+func negativeKeywordsParam(params map[string]any) []analytics.NegativeKeyword {
+	v, ok := params["keywords"]
+	if !ok || v == nil {
+		return nil
+	}
+	if s, ok := v.(string); ok {
+		out := make([]analytics.NegativeKeyword, 0, 1)
+		for _, part := range strings.Split(s, ",") {
+			out = append(out, analytics.NegativeKeyword{Text: strings.TrimSpace(part)})
+		}
+		return out
+	}
+	items, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]analytics.NegativeKeyword, 0, len(items))
+	for _, item := range items {
+		switch value := item.(type) {
+		case string:
+			out = append(out, analytics.NegativeKeyword{Text: strings.TrimSpace(value)})
+		case map[string]any:
+			out = append(out, analytics.NegativeKeyword{
+				Text:      stringParam(value, "text", "keyword", "term"),
+				MatchType: stringParam(value, "match_type", "matchType"),
+			})
+		}
+	}
+	return out
+}
+
+// amountMicrosParam reads a micros amount, falling back to whole currency units
+// when the caller sends `amount` instead.
+func amountMicrosParam(params map[string]any, key string) (int64, error) {
+	if v, ok := params[key]; ok {
+		f, err := toFloat(v)
+		if err != nil {
+			return 0, fmt.Errorf("ongeldig bedrag in %s: %w", key, err)
+		}
+		return int64(f), nil
+	}
+	for _, fallback := range []string{"amount_micros", "amount", "budget_amount"} {
+		v, ok := params[fallback]
+		if !ok {
+			continue
+		}
+		f, err := toFloat(v)
+		if err != nil {
+			return 0, fmt.Errorf("ongeldig bedrag in %s: %w", fallback, err)
+		}
+		if fallback == "amount" || fallback == "budget_amount" {
+			return int64(f * 1e6), nil
+		}
+		return int64(f), nil
+	}
+	return 0, fmt.Errorf("%s is verplicht", key)
 }
 
 func stringListParam(params map[string]any, key string) []string {
