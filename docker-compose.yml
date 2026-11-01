@@ -1,0 +1,27 @@
+# Self-hosted analytics-mcp (bo) — /home/hermes/apps/analytics-mcp
+# Alleen 127.0.0.1 + tailnet gepubliceerd; Plesk nginx termineert TLS en proxyt
+# https://analytics.studiovanderheide.nl -> 127.0.0.1:8097.
+services:
+  analytics-mcp:
+    build:
+      context: .
+    image: analytics-mcp:local
+    container_name: analytics-mcp
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8097:8080"
+      - "100.64.144.93:8097:8080"
+    volumes:
+      # Zonder dit ben je alle sessies kwijt bij een herstart.
+      - analytics-mcp-tokens:/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  analytics-mcp-tokens:

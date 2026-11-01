@@ -1,0 +1,33 @@
+# analytics-mcp
+
+Self-hosted MCP + JSON API server for three Google APIs: Analytics Data (GA4),
+Search Console and Google Ads (including campaign pause/enable, negative
+keywords and budget writes).
+
+## Connectors and accounts
+
+| connector | account | example fields |
+|---|---|---|
+| `googleanalytics4` | GA4 property id | `date`, `source`, `sessions`, `users`, `screen_page_views` |
+| `searchconsole` | Search Console property URL | `query`, `page`, `date`, `clicks`, `impressions`, `ctr`, `position` |
+| `google_ads` | Google Ads customer id | `campaign_name`, `spend`, `clicks`, `conversions`, `search_term` |
+| `google_ads` + `options.keyword_seeds` | customer id | Keyword Planner ideas: volume, competition, top-of-page bids |
+
+## HTTP API (dashboards)
+
+POST /query  {connector, account, fields[], date_from, date_to, group_by[], limit}
+             -> {status:"done", data:[...], total_rows:N}
+POST /action {connector, account, action, params{}}
+             actions: pause_campaign, enable_campaign, push_negative_keywords,
+                      set_campaign_budget
+
+Both require `Authorization: Bearer <token>` from the OAuth flow at /authorize.
+
+## MCP tools
+
+ping, auth_status, ga4_report, gsc_query, ads_search, ads_keyword_ideas,
+ads_set_campaign_status (confirm: true), ads_push_negative_keywords (confirm: true).
+
+Get started: call `auth_status`; if it reports `authenticated: false`, open
+/authorize in a browser and link a Google account that can see the GA4 property,
+the Search Console site and the Ads account.
