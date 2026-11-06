@@ -114,3 +114,29 @@ func TestBoolParamSpellings(t *testing.T) {
 		t.Errorf("niets meegestuurd hoort nil te zijn, kreeg %v", *ptr)
 	}
 }
+
+// De eigen MCP-tool stuurt de negatieve zoekwoorden als []string, een
+// HTTP-client als []any (of één komma-string). Alle drie moeten door
+// negativeKeywordsParam heen: een []string faalde hier eerder de []any-assertie,
+// waardoor ads_push_negative_keywords altijd "geen (niet-lege) negative keywords
+// ontvangen" teruggaf zonder iets te schrijven.
+func TestNegativeKeywordsParamShapes(t *testing.T) {
+	got := negativeKeywordsParam(map[string]any{"keywords": []string{"jacco silver", "  la fuente  "}})
+	if len(got) != 2 || got[0].Text != "jacco silver" || got[1].Text != "la fuente" {
+		t.Fatalf("[]string gaf %#v", got)
+	}
+	if got := negativeKeywordsParam(map[string]any{
+		"keywords": []any{"a", map[string]any{"text": "b", "match_type": "EXACT"}},
+	}); len(got) != 2 || got[1].Text != "b" || got[1].MatchType != "EXACT" {
+		t.Errorf("[]any gaf %#v", got)
+	}
+	if got := negativeKeywordsParam(map[string]any{"keywords": "a, b ,,c"}); len(got) != 3 {
+		t.Errorf("komma-lijst gaf %d items, want 3", len(got))
+	}
+	if got := negativeKeywordsParam(map[string]any{"keywords": []string{}}); len(got) != 0 {
+		t.Errorf("lege lijst hoort leeg te blijven, kreeg %#v", got)
+	}
+	if got := negativeKeywordsParam(map[string]any{}); got != nil {
+		t.Errorf("zonder keywords verwacht nil, kreeg %#v", got)
+	}
+}

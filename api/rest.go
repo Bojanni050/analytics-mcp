@@ -587,9 +587,24 @@ func negativeKeywordsParam(params map[string]any) []analytics.NegativeKeyword {
 	if s, ok := v.(string); ok {
 		out := make([]analytics.NegativeKeyword, 0, 1)
 		for _, part := range strings.Split(s, ",") {
-			out = append(out, analytics.NegativeKeyword{Text: strings.TrimSpace(part)})
+			// Lege segmenten ("a,,b") overslaan; anders telt de actie een
+			// leeg zoekwoord mee dat downstream toch wordt overgeslagen.
+			if text := strings.TrimSpace(part); text != "" {
+				out = append(out, analytics.NegativeKeyword{Text: text})
+			}
 		}
 		return out
+	}
+	// De MCP-laag stuurt de lijst als []string, het JSON-pad levert []any.
+	// Zonder deze conversie faalt de []any-assertie hieronder op de eigen tools
+	// en lijkt het of er geen keywords zijn meegestuurd ("geen (niet-lege)
+	// negative keywords ontvangen") terwijl de caller er net 49 stuurde.
+	if list, ok := v.([]string); ok {
+		converted := make([]any, 0, len(list))
+		for _, item := range list {
+			converted = append(converted, item)
+		}
+		v = converted
 	}
 	items, ok := v.([]any)
 	if !ok {
