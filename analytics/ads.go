@@ -165,16 +165,22 @@ func buildAdsQuery(requested, conditions, orderings []string, limit int) (string
 	for _, f := range requested {
 		api, ok := adsFields[f]
 		if !ok {
-			return "", nil, fmt.Errorf("google_ads: onbekend veld %q", f)
+			// Niet-gemapte GAQL-paden (conversion_action.status,
+			// customer_conversion_goal.biddable, …) gaan ongewijzigd door:
+			// anders blokkeert de mapping elke nieuwe resource. Google's eigen
+			// foutmelding is dan de terugkoppeling bij een typefout.
+			raw, err := rawAdsField(f)
+			if err != nil {
+				return "", nil, err
+			}
+			api = raw
 		}
 		paths[f] = api
 		selects = append(selects, api)
-		if resource == "" {
-			resource = adsResources[api]
-		} else if r, ok := adsResources[api]; ok && r != resource {
-			// keyword_view and search_term_view also carry campaign metrics; the
-			// more specific resource wins in that case.
-			if resource == "campaign" {
+		if r := adsFieldResource(api); r != "" {
+			if resource == "" || (resource == "campaign" && r != "campaign") {
+				// keyword_view en search_term_view dragen ook campagnemetrics;
+				// de specifiekere resource wint dan.
 				resource = r
 			}
 		}
@@ -201,6 +207,46 @@ func buildAdsQuery(requested, conditions, orderings []string, limit int) (string
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
 	return query, paths, nil
+}
+
+// adsFieldResource maps a GAQL path onto the resource that should sit in the
+// FROM clause: the mapping table first, otherwise the first path segment.
+func adsFieldResource(api string) string {
+	if resource, ok := adsResources[api]; ok {
+		return resource
+	}
+	head := api
+	if i := strings.Index(api, "."); i > 0 {
+		head = api[:i]
+	}
+	switch head {
+	case "metrics", "segments":
+		return "" // die horen altijd via de mapping te gaan
+	}
+	return head
+}
+
+// rawAdsField accepts a GAQL path that is not in the app's field mapping, so a
+// new Ads resource does not need a mapping entry before it can be queried.
+func rawAdsField(field string) (string, error) {
+	trimmed := strings.TrimSpace(field)
+	if !strings.Contains(trimmed, ".") || strings.ContainsAny(trimmed, " ,()'\"`;") {
+		return "", fmt.Errorf("google_ads: onbekend veld %q", field)
+	}
+	// metrics.* en segments.* horen via de mapping te gaan: die bepalen ook of
+	// een waarde een getal is.
+	switch head := trimmed[:strings.Index(trimmed, ".")]; head {
+	case "metrics", "segments":
+		return "", fmt.Errorf("google_ads: onbekend veld %q", field)
+	}
+	for _, r := range trimmed {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_':
+		default:
+			return "", fmt.Errorf("google_ads: onbekend veld %q", field)
+		}
+	}
+	return trimmed, nil
 }
 
 func containsDateCondition(conditions []string) bool {

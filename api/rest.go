@@ -66,12 +66,14 @@ type ActionRequest struct {
 // ActionResponse reports what a write did. Newly created entities carry their
 // id so the caller can chain (campagne aanmaken → ad group aanmaken).
 type ActionResponse struct {
-	Status     string `json:"status"`
-	Action     string `json:"action"`
-	Affected   int    `json:"affected"`
-	Message    string `json:"message,omitempty"`
-	CampaignID string `json:"campaign_id,omitempty"`
-	AdGroupID  string `json:"ad_group_id,omitempty"`
+	Status        string   `json:"status"`
+	Action        string   `json:"action"`
+	Affected      int      `json:"affected"`
+	Message       string   `json:"message,omitempty"`
+	CampaignID    string   `json:"campaign_id,omitempty"`
+	AdGroupID     string   `json:"ad_group_id,omitempty"`
+	ResourceNames []string `json:"resource_names,omitempty"`
+	Validated     bool     `json:"validated_only,omitempty"`
 }
 
 // SupportedConnectors are the connector ids this facade understands.
@@ -87,6 +89,13 @@ var knownAdsActions = map[string]bool{
 	"set_campaign_budget":    true,
 	"create_campaign":        true,
 	"create_ad_group":        true,
+	"mutate":                 true,
+	"add_keywords":           true,
+	"set_keyword_status":     true,
+	"remove_keyword":         true,
+	"set_ad_group_status":    true,
+	"set_ad_status":          true,
+	"set_conversion_action":  true,
 }
 
 // sortedAdsActions lists the supported Google Ads actions for error messages.
@@ -211,18 +220,344 @@ func RunAction(ctx context.Context, req ActionRequest) (ActionResponse, error) {
 
 		case "set_campaign_budget":
 			budget := stringParam(req.Params, "budget_resource_name", "budgetResourceName")
+			if budget == "" {
+				resolved, err := client.CampaignBudgetResourceName(ctx, req.Account,
+					stringParam(req.Params, "campaign_id", "campaignId"), req.LoginCustomerID)
+				if err != nil {
+					return ActionResponse{}, err
+				}
+				budget = resolved
+			}
 			micros, err := intParamMicros(req.Params)
 			if err != nil {
 				return ActionResponse{}, err
 			}
-			if err := client.SetCampaignBudget(ctx, req.Account, budget, micros, req.LoginCustomerID); err != nil {
+			opts := mutateOptionsParam(req.Params)
+			res, err := client.AdsMutate(ctx, req.Account, []analytics.MutateOperation{{
+				Action:       "update",
+				Resource:     "campaign_budget",
+				ResourceName: budget,
+				Object:       map[string]any{"amount_micros": strconv.FormatInt(micros, 10)},
+				UpdateMask:   []string{"amount_micros"},
+			}}, opts, req.LoginCustomerID)
+			if err != nil {
 				return ActionResponse{}, err
 			}
-			return ActionResponse{Status: "ok", Action: action, Affected: 1, Message: "dagbudget → " + strconv.FormatFloat(float64(micros)/1e6, 'f', 2, 64)}, nil
+			return ActionResponse{
+				Status: "ok", Action: action, Affected: 1,
+				ResourceNames: res.ResourceNames, Validated: res.Validated,
+				Message: "dagbudget → " + strconv.FormatFloat(float64(micros)/1e6, 'f', 2, 64) + mutateSuffix(res),
+			}, nil
+
+		case "mutate":
+			ops, opts, err := mutateParams(req.Params)
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			res, err := client.AdsMutate(ctx, req.Account, ops, opts, req.LoginCustomerID)
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			return ActionResponse{
+				Status: "ok", Action: action, Affected: len(ops),
+				ResourceNames: res.ResourceNames, Validated: res.Validated,
+				Message: mutateMessage(res),
+			}, nil
+
+		case "add_keywords":
+			keywords := keywordInputsParam(req.Params)
+			opts := mutateOptionsParam(req.Params)
+			res, err := client.AddKeywords(ctx, req.Account,
+				stringParam(req.Params, "ad_group_id", "adGroupId"), keywords, opts, req.LoginCustomerID)
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			return ActionResponse{
+				Status: "ok", Action: action, Affected: len(keywords),
+				ResourceNames: res.ResourceNames, Validated: res.Validated,
+				Message: mutateMessage(res),
+			}, nil
+
+		case "set_keyword_status", "remove_keyword":
+			name, err := analytics.AdsMutationResourceName(req.Account, "ad_group_criterion",
+				stringParam(req.Params, "ad_group_id", "adGroupId"),
+				stringParam(req.Params, "criterion_id", "criterionId"))
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			opts := mutateOptionsParam(req.Params)
+			var res analytics.MutateResult
+			if action == "remove_keyword" {
+				res, err = client.RemoveAdsResource(ctx, req.Account, "ad_group_criterion", name, opts, req.LoginCustomerID)
+			} else {
+				res, err = client.SetAdsStatus(ctx, req.Account, "ad_group_criterion", name,
+					stringParam(req.Params, "status"), opts, req.LoginCustomerID)
+			}
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			return ActionResponse{
+				Status: "ok", Action: action, Affected: 1,
+				ResourceNames: res.ResourceNames, Validated: res.Validated,
+				Message: mutateMessage(res),
+			}, nil
+
+		case "set_ad_group_status", "set_ad_status":
+			resource := "ad_group"
+			itemID := stringParam(req.Params, "ad_group_id", "adGroupId")
+			parentID := ""
+			if action == "set_ad_status" {
+				resource, parentID, itemID = "ad_group_ad", itemID, stringParam(req.Params, "ad_id", "adId")
+			}
+			name, err := analytics.AdsMutationResourceName(req.Account, resource, parentID, itemID)
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			opts := mutateOptionsParam(req.Params)
+			res, err := client.SetAdsStatus(ctx, req.Account, resource, name,
+				stringParam(req.Params, "status"), opts, req.LoginCustomerID)
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			return ActionResponse{
+				Status: "ok", Action: action, Affected: 1,
+				ResourceNames: res.ResourceNames, Validated: res.Validated,
+				Message: mutateMessage(res),
+			}, nil
+
+		case "set_conversion_action":
+			opts := mutateOptionsParam(req.Params)
+			res, err := client.SetConversionActionSettings(ctx, req.Account,
+				stringParam(req.Params, "conversion_action_id", "conversionActionId", "id"),
+				boolPtrParam(req.Params, "primary_for_goal", "primaryForGoal"),
+				boolPtrParam(req.Params, "include_in_conversions_metric", "includeInConversionsMetric"),
+				stringParam(req.Params, "status"), opts, req.LoginCustomerID)
+			if err != nil {
+				return ActionResponse{}, err
+			}
+			return ActionResponse{
+				Status: "ok", Action: action, Affected: 1,
+				ResourceNames: res.ResourceNames, Validated: res.Validated,
+				Message: mutateMessage(res),
+			}, nil
 		}
 		return ActionResponse{}, fmt.Errorf("onbekende actie %q voor google_ads", req.Action)
 	}
 	return ActionResponse{}, fmt.Errorf("onbekende connector %q voor acties", req.Connector)
+}
+
+// mutateOptionsParam reads the safety switches of a write: validate_only asks
+// Google to check the mutation without applying it, partial_failure keeps going
+// when one operation in a batch is rejected.
+func mutateOptionsParam(params map[string]any) analytics.MutateOptions {
+	return analytics.MutateOptions{
+		ValidateOnly:   boolParam(params, "validate_only", "validateOnly"),
+		PartialFailure: boolParam(params, "partial_failure", "partialFailure"),
+	}
+}
+
+// mutateMessage turns the engine's result into one readable line.
+func mutateMessage(res analytics.MutateResult) string {
+	parts := make([]string, 0, 3)
+	if res.Validated {
+		parts = append(parts, "alleen gevalideerd (validate_only): er is niets gewijzigd")
+	}
+	if res.Partial {
+		parts = append(parts, "partial_failure staat aan")
+	}
+	if len(res.Warnings) > 0 {
+		parts = append(parts, "waarschuwing: "+strings.Join(res.Warnings, "; "))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// mutateSuffix lists only the "nothing was changed" / warning notes, for
+// messages that have their own text already.
+func mutateSuffix(res analytics.MutateResult) string {
+	if suffix := mutateMessage(res); suffix != "" {
+		return " (" + suffix + ")"
+	}
+	return ""
+}
+
+// mutateParams accepts one operation in the params itself, or a list under
+// "operations" for bulk work (zoekwoorden toevoegen in één call).
+func mutateParams(params map[string]any) ([]analytics.MutateOperation, analytics.MutateOptions, error) {
+	opts := mutateOptionsParam(params)
+	raw, hasList := params["operations"]
+	if !hasList {
+		op, err := mutateOperation(params)
+		if err != nil {
+			return nil, opts, err
+		}
+		return []analytics.MutateOperation{op}, opts, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, opts, fmt.Errorf("operations moet een lijst met operaties zijn")
+	}
+	ops := make([]analytics.MutateOperation, 0, len(items))
+	for i, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, opts, fmt.Errorf("operatie %d is geen object", i+1)
+		}
+		op, err := mutateOperation(m)
+		if err != nil {
+			return nil, opts, err
+		}
+		ops = append(ops, op)
+	}
+	return ops, opts, nil
+}
+
+func mutateOperation(params map[string]any) (analytics.MutateOperation, error) {
+	op := analytics.MutateOperation{
+		Resource:     stringParam(params, "resource"),
+		Action:       stringParam(params, "op", "operation", "mutate_action"),
+		ResourceName: stringParam(params, "resource_name", "resourceName"),
+		UpdateMask:   stringListParam(params, "update_mask"),
+	}
+	for _, key := range []string{"object", "fields", "values"} {
+		if m := mapParam(params, key); m != nil {
+			op.Object = m
+			break
+		}
+	}
+	if op.Action == "" {
+		return op, fmt.Errorf("op is verplicht (create, update of remove)")
+	}
+	if op.Resource == "" {
+		return op, fmt.Errorf("resource is verplicht (kies uit: %s)", strings.Join(analytics.AdsMutationResources(), ", "))
+	}
+	return op, nil
+}
+
+// keywordInputsParam accepts ["term", …] or [{"text": …, "match_type": …}, …],
+// with shared defaults for match type, status and cpc bid.
+func keywordInputsParam(params map[string]any) []analytics.KeywordInput {
+	raw, ok := params["keywords"]
+	if !ok || raw == nil {
+		return nil
+	}
+	defaultMatch := stringParam(params, "match_type", "matchType")
+	defaultStatus := stringParam(params, "status")
+	bidMicros := int64Param(params, "cpc_bid_micros", "cpcBidMicros")
+	if bidMicros == 0 {
+		bidMicros = int64(floatParam(params, "cpc_bid", "cpcBid") * 1e6)
+	}
+
+	out := []analytics.KeywordInput{}
+	add := func(keyword analytics.KeywordInput) {
+		if keyword.Text == "" {
+			return
+		}
+		if keyword.MatchType == "" {
+			keyword.MatchType = defaultMatch
+		}
+		if keyword.Status == "" {
+			keyword.Status = defaultStatus
+		}
+		if keyword.CPCBidMicros == 0 {
+			keyword.CPCBidMicros = bidMicros
+		}
+		out = append(out, keyword)
+	}
+
+	switch value := raw.(type) {
+	case string:
+		for _, part := range strings.Split(value, ",") {
+			add(analytics.KeywordInput{Text: strings.TrimSpace(part)})
+		}
+	case []any:
+		for _, item := range value {
+			switch keyword := item.(type) {
+			case string:
+				add(analytics.KeywordInput{Text: strings.TrimSpace(keyword)})
+			case map[string]any:
+				add(analytics.KeywordInput{
+					Text:         stringParam(keyword, "text", "keyword", "term"),
+					MatchType:    stringParam(keyword, "match_type", "matchType"),
+					Status:       stringParam(keyword, "status"),
+					CPCBidMicros: int64Param(keyword, "cpc_bid_micros", "cpcBidMicros"),
+				})
+			}
+		}
+	}
+	return out
+}
+
+// boolParam reads a boolean, tolerating the string and numeric spellings a
+// client may send.
+func boolParam(params map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		v, ok := params[key]
+		if !ok {
+			continue
+		}
+		switch value := v.(type) {
+		case bool:
+			return value
+		case float64:
+			return value != 0
+		case string:
+			switch strings.ToLower(strings.TrimSpace(value)) {
+			case "true", "1", "yes", "ja":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// boolPtrParam distinguishes "not sent" from "false": only a field the caller
+// actually sent may end up in an update.
+func boolPtrParam(params map[string]any, keys ...string) *bool {
+	for _, key := range keys {
+		if _, ok := params[key]; !ok {
+			continue
+		}
+		value := boolParam(params, key)
+		return &value
+	}
+	return nil
+}
+
+func mapParam(params map[string]any, key string) map[string]any {
+	v, ok := params[key]
+	if !ok || v == nil {
+		return nil
+	}
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
+}
+
+func int64Param(params map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		v, ok := params[key]
+		if !ok {
+			continue
+		}
+		if f, err := toFloat(v); err == nil {
+			return int64(f)
+		}
+	}
+	return 0
+}
+
+func floatParam(params map[string]any, keys ...string) float64 {
+	for _, key := range keys {
+		v, ok := params[key]
+		if !ok {
+			continue
+		}
+		if f, err := toFloat(v); err == nil {
+			return f
+		}
+	}
+	return 0
 }
 
 func stringParam(params map[string]any, keys ...string) string {

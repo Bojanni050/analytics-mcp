@@ -91,6 +91,36 @@ func TestBuildAdsQuery(t *testing.T) {
 	}
 }
 
+// Nieuwe Ads-resources mogen niet geblokkeerd worden door de veldmapping: een
+// dotted GAQL-pad gaat door, met de resource uit het eerste segment.
+func TestBuildAdsQueryPassesThroughUnmappedFields(t *testing.T) {
+	query, paths, err := buildAdsQuery(
+		[]string{"conversion_action.status", "conversion_action.name"},
+		[]string{"conversion_action.id = 7890373170"}, nil, 0)
+	if err != nil {
+		t.Fatalf("dotted pad gaf fout: %v", err)
+	}
+	want := "SELECT conversion_action.status, conversion_action.name FROM conversion_action " +
+		"WHERE conversion_action.id = 7890373170"
+	if query != want {
+		t.Errorf("query =\n%s\nwant =\n%s", query, want)
+	}
+	if paths["conversion_action.status"] != "conversion_action.status" {
+		t.Errorf("pad = %q", paths["conversion_action.status"])
+	}
+
+	// Een typefout zonder punt blijft een fout, en metrics horen via de mapping.
+	if _, _, err := buildAdsQuery([]string{"bestaat_niet"}, nil, nil, 0); err == nil {
+		t.Error("een niet-bestaand veld zonder punt hoort te falen")
+	}
+	if _, _, err := buildAdsQuery([]string{"metrics.iets_nieuws"}, nil, nil, 0); err == nil {
+		t.Error("metrics horen via de mapping te gaan")
+	}
+	if _, _, err := buildAdsQuery([]string{"campaign.name; DROP"}, nil, nil, 0); err == nil {
+		t.Error("een pad met rare tekens hoort te falen")
+	}
+}
+
 // Google's REST-JSON gebruikt camelCase, GAQL snake_case. Zonder deze vertaling
 // kwam metrics.cost_micros leeg terug (kosten op nul).
 func TestToCamelPath(t *testing.T) {

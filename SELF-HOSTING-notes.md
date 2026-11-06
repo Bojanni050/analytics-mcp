@@ -22,10 +22,37 @@ Eén service naast `gtm-mcp-server` (8095) en `google-ads-mcp` (8096).
 Twee oppervlakken op dezelfde OAuth-stack:
 
 - **MCP** (`POST /`): `ping`, `auth_status`, `ga4_report`, `gsc_query`, `ads_search`,
-  `ads_keyword_ideas`, `ads_set_campaign_status` (confirm), `ads_push_negative_keywords` (confirm).
+  `ads_keyword_ideas`, `ads_set_campaign_status`, `ads_push_negative_keywords`, `ads_mutate`,
+  `ads_add_keywords`, `ads_set_keyword_status`, `ads_remove_keyword`, `ads_set_ad_group_status`,
+  `ads_set_ad_status`, `ads_set_campaign_budget`, `ads_conversion_action_update`
+  (16 tools; elke write eist `confirm: true`).
 - **Flat JSON-API** voor Adlytica: `POST /query` en `POST /action`, met de vorm die de app
   al kende (`connector`, `account`, `fields`, `date_from`, `date_to`, `group_by`, `limit`
   → `{status, data, total_rows}`).
+
+### Ads-schrijfacties (sinds 6 nov 2026)
+
+`ads_mutate` is de generieke route: `{resource, op: create|update|remove, object, update_mask}`
+voor `campaign`, `campaign_budget`, `ad_group`, `ad_group_criterion` (zoekwoorden),
+`campaign_criterion` (negatieve zoekwoorden), `ad_group_ad`, `conversion_action`,
+`customer_conversion_goal`, `ad_group_bid_modifier`, `asset`, `campaign_asset`, `shared_set`,
+`shared_criterion`. Daarnaast ingekorte tools voor zoekwoorden, statussen, budget en
+conversieacties. Vaste afspraken:
+
+- Zonder `confirm: true` gebeurt er niets; `validate_only: true` laat Google de mutatie keuren
+  zonder hem toe te passen (gebruik dat eerst).
+- Campagnes en ad groups gaan alleen naar `PAUSED`, nooit `REMOVED`; zoekwoorden, advertenties
+  en criteria mogen wel weg.
+- **`primary_for_goal` en `include_in_conversions_metric` zijn immutabel** op een
+  conversieactie (Google: `IMMUTABLE_FIELD`). "Meetellen voor bieden" zit op doelniveau:
+  `customer_conversion_goal.biddable`, per `category~origin`. Dat doel bestaat alleen als
+  Google het heeft gematerialiseerd — zet de conversieactie op `ENABLED` en het doel
+  (`SUBMIT_LEAD_FORM~WEBSITE` voor GA4-leadimports) verschijnt meteen; een doel *aanmaken*
+  kan niet via de API (`create` bestaat niet, `update` geeft `RESOURCE_NOT_FOUND`).
+- Na elke mutatie hoort een read-back: `ads_mutate` geeft de resourceNames terug, en met
+  `ads_search` lees je de velden opnieuw.
+- `mcp-check.py` in de repo-root praat rechtstreeks met de MCP (initialize + tools/list +
+  optioneel tools/call) en is de snelste manier om een write end-to-end te controleren.
 
 Connectors: `googleanalytics4` (property-id), `searchconsole` (property-URL), `google_ads`
 (customer-id). `google_ads` + `options.keyword_seeds` gaat naar de KeywordPlanIdeaService

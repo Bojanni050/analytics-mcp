@@ -21,6 +21,11 @@ func registerTools(server *mcp.Server) {
 	registerAdsKeywordIdeas(server)
 	registerAdsSetCampaignStatus(server)
 	registerAdsNegativeKeywords(server)
+	registerAdsMutate(server)
+	registerAdsKeywords(server)
+	registerAdsStatusTools(server)
+	registerAdsBudget(server)
+	registerAdsConversionAction(server)
 }
 
 // --- utility ---------------------------------------------------------------
@@ -264,6 +269,279 @@ func registerAdsNegativeKeywords(server *mcp.Server) {
 				"match_type":  input.MatchType,
 			},
 		})
+		if err != nil {
+			return nil, api.ActionResponse{}, err
+		}
+		return nil, out, nil
+	})
+}
+
+// --- Google Ads writes -----------------------------------------------------
+//
+// Elke write loopt door runAdsWrite: zonder confirm: true gebeurt er niets, en
+// met validate_only: true keurt Google de mutatie zonder hem toe te passen. Doe
+// die droogloop eerst bij twijfel — de Ads API weigert sommige velden (bij een
+// GA4-import bijvoorbeeld) en dan zie je dat vóór er iets live staat.
+
+func runAdsWrite(ctx context.Context, confirm bool, customerID, action string, params map[string]any, impact string) (api.ActionResponse, error) {
+	if !confirm {
+		return api.ActionResponse{}, fmt.Errorf("confirm must be true - %s", impact)
+	}
+	return api.RunAction(ctx, api.ActionRequest{
+		Connector: "google_ads",
+		Account:   customerID,
+		Action:    action,
+		Params:    params,
+	})
+}
+
+type AdsMutateInput struct {
+	CustomerID     string           `json:"customer_id" jsonschema:"Google Ads customer ID"`
+	Operation      map[string]any   `json:"operation,omitempty" jsonschema:"Eén operatie: {resource, op, object of resource_name, update_mask}"`
+	Operations     []map[string]any `json:"operations,omitempty" jsonschema:"Meerdere operaties in één call (max 1000)"`
+	ValidateOnly   bool             `json:"validate_only,omitempty" jsonschema:"true = alleen laten valideren, er wijzigt niets"`
+	PartialFailure bool             `json:"partial_failure,omitempty" jsonschema:"true = doorgaan als één operatie wordt afgewezen"`
+	Confirm        bool             `json:"confirm" jsonschema:"Must be true - dit wijzigt live advertenties"`
+}
+
+func registerAdsMutate(server *mcp.Server) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "ads_mutate",
+		Description: "Wijzig elke ondersteunde Google Ads-resource (create/update/remove): campaign, " +
+			"campaign_budget, ad_group, ad_group_criterion (zoekwoorden), campaign_criterion (negatieve " +
+			"zoekwoorden), ad_group_ad, conversion_action, ad_group_bid_modifier, asset, campaign_asset, " +
+			"shared_set, shared_criterion. Vereist confirm: true; gebruik validate_only voor een droogloop. " +
+			"Campagnes en ad groups kunnen alleen op PAUSED, niet verwijderd.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input AdsMutateInput) (*mcp.CallToolResult, api.ActionResponse, error) {
+		params := map[string]any{
+			"validate_only":   input.ValidateOnly,
+			"partial_failure": input.PartialFailure,
+		}
+		switch {
+		case len(input.Operations) > 0:
+			list := make([]any, 0, len(input.Operations))
+			for _, op := range input.Operations {
+				list = append(list, op)
+			}
+			params["operations"] = list
+		case len(input.Operation) > 0:
+			for key, value := range input.Operation {
+				params[key] = value
+			}
+		default:
+			return nil, api.ActionResponse{}, fmt.Errorf("geef een operation of een operations-lijst mee")
+		}
+		out, err := runAdsWrite(ctx, input.Confirm, input.CustomerID, "mutate", params,
+			"een Ads-mutatie wijzigt live advertenties")
+		if err != nil {
+			return nil, api.ActionResponse{}, err
+		}
+		return nil, out, nil
+	})
+}
+
+type AdsAddKeywordsInput struct {
+	CustomerID   string   `json:"customer_id" jsonschema:"Google Ads customer ID"`
+	AdGroupID    string   `json:"ad_group_id" jsonschema:"Ad group waarin de zoekwoorden komen"`
+	Keywords     []string `json:"keywords" jsonschema:"Zoekwoorden als platte tekst, zonder match-type-haken"`
+	MatchType    string   `json:"match_type,omitempty" jsonschema:"BROAD (default), PHRASE of EXACT"`
+	Status       string   `json:"status,omitempty" jsonschema:"ENABLED (default) of PAUSED"`
+	CPCBidMicros int64    `json:"cpc_bid_micros,omitempty" jsonschema:"Optioneel maximum-cpc-bod in micros (1500000 = 1,50)"`
+	ValidateOnly bool     `json:"validate_only,omitempty" jsonschema:"true = alleen laten valideren, er wijzigt niets"`
+	Confirm      bool     `json:"confirm" jsonschema:"Must be true - dit voegt live zoekwoorden toe"`
+}
+
+type AdsKeywordStatusInput struct {
+	CustomerID   string `json:"customer_id" jsonschema:"Google Ads customer ID"`
+	AdGroupID    string `json:"ad_group_id" jsonschema:"Ad group van het zoekwoord"`
+	CriterionID  string `json:"criterion_id" jsonschema:"Criterium-id van het zoekwoord (ad_group_criterion.id)"`
+	Status       string `json:"status" jsonschema:"ENABLED, PAUSED of REMOVED"`
+	ValidateOnly bool   `json:"validate_only,omitempty" jsonschema:"true = alleen laten valideren, er wijzigt niets"`
+	Confirm      bool   `json:"confirm" jsonschema:"Must be true - dit wijzigt live zoekwoorden"`
+}
+
+type AdsRemoveKeywordInput struct {
+	CustomerID  string `json:"customer_id" jsonschema:"Google Ads customer ID"`
+	AdGroupID   string `json:"ad_group_id" jsonschema:"Ad group van het zoekwoord"`
+	CriterionID string `json:"criterion_id" jsonschema:"Criterium-id van het zoekwoord (ad_group_criterion.id)"`
+	Confirm     bool   `json:"confirm" jsonschema:"Must be true - dit verwijdert het zoekwoord definitief"`
+}
+
+func registerAdsKeywords(server *mcp.Server) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ads_add_keywords",
+		Description: "Voeg zoekwoorden toe aan één ad group (vereist confirm: true; validate_only eerst bij twijfel)",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input AdsAddKeywordsInput) (*mcp.CallToolResult, api.ActionResponse, error) {
+		keywords := make([]any, 0, len(input.Keywords))
+		for _, keyword := range input.Keywords {
+			if trimmed := strings.TrimSpace(keyword); trimmed != "" {
+				keywords = append(keywords, trimmed)
+			}
+		}
+		params := map[string]any{
+			"ad_group_id":   input.AdGroupID,
+			"keywords":      keywords,
+			"match_type":    input.MatchType,
+			"status":        input.Status,
+			"validate_only": input.ValidateOnly,
+		}
+		if input.CPCBidMicros > 0 {
+			params["cpc_bid_micros"] = input.CPCBidMicros
+		}
+		out, err := runAdsWrite(ctx, input.Confirm, input.CustomerID, "add_keywords", params,
+			"zoekwoorden toevoegen verandert live advertenties")
+		if err != nil {
+			return nil, api.ActionResponse{}, err
+		}
+		return nil, out, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ads_set_keyword_status",
+		Description: "Zet één zoekwoord op ENABLED, PAUSED of REMOVED (vereist confirm: true)",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input AdsKeywordStatusInput) (*mcp.CallToolResult, api.ActionResponse, error) {
+		params := map[string]any{
+			"ad_group_id":   input.AdGroupID,
+			"criterion_id":  input.CriterionID,
+			"status":        input.Status,
+			"validate_only": input.ValidateOnly,
+		}
+		out, err := runAdsWrite(ctx, input.Confirm, input.CustomerID, "set_keyword_status", params,
+			"de status van een zoekwoord verandert live advertenties")
+		if err != nil {
+			return nil, api.ActionResponse{}, err
+		}
+		return nil, out, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ads_remove_keyword",
+		Description: "Verwijder één zoekwoord uit een ad group (vereist confirm: true)",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input AdsRemoveKeywordInput) (*mcp.CallToolResult, api.ActionResponse, error) {
+		params := map[string]any{
+			"ad_group_id":  input.AdGroupID,
+			"criterion_id": input.CriterionID,
+		}
+		out, err := runAdsWrite(ctx, input.Confirm, input.CustomerID, "remove_keyword", params,
+			"een zoekwoord verwijderen kan niet teruggedraaid worden")
+		if err != nil {
+			return nil, api.ActionResponse{}, err
+		}
+		return nil, out, nil
+	})
+}
+
+type AdsStatusInput struct {
+	CustomerID   string `json:"customer_id" jsonschema:"Google Ads customer ID"`
+	AdGroupID    string `json:"ad_group_id" jsonschema:"Ad group id"`
+	AdID         string `json:"ad_id,omitempty" jsonschema:"Advertentie-id (alleen bij ad_status, ad_group_ad.ad.id)"`
+	Status       string `json:"status" jsonschema:"ENABLED of PAUSED"`
+	ValidateOnly bool   `json:"validate_only,omitempty" jsonschema:"true = alleen laten valideren, er wijzigt niets"`
+	Confirm      bool   `json:"confirm" jsonschema:"Must be true - dit wijzigt live advertenties"`
+}
+
+func registerAdsStatusTools(server *mcp.Server) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ads_set_ad_group_status",
+		Description: "Pauzeer of activeer een ad group (vereist confirm: true)",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input AdsStatusInput) (*mcp.CallToolResult, api.ActionResponse, error) {
+		params := map[string]any{
+			"ad_group_id":   input.AdGroupID,
+			"status":        input.Status,
+			"validate_only": input.ValidateOnly,
+		}
+		out, err := runAdsWrite(ctx, input.Confirm, input.CustomerID, "set_ad_group_status", params,
+			"de status van een ad group verandert live advertenties")
+		if err != nil {
+			return nil, api.ActionResponse{}, err
+		}
+		return nil, out, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ads_set_ad_status",
+		Description: "Pauzeer of activeer één advertentie (vereist confirm: true)",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input AdsStatusInput) (*mcp.CallToolResult, api.ActionResponse, error) {
+		params := map[string]any{
+			"ad_group_id":   input.AdGroupID,
+			"ad_id":         input.AdID,
+			"status":        input.Status,
+			"validate_only": input.ValidateOnly,
+		}
+		out, err := runAdsWrite(ctx, input.Confirm, input.CustomerID, "set_ad_status", params,
+			"de status van een advertentie verandert live advertenties")
+		if err != nil {
+			return nil, api.ActionResponse{}, err
+		}
+		return nil, out, nil
+	})
+}
+
+type AdsBudgetInput struct {
+	CustomerID         string  `json:"customer_id" jsonschema:"Google Ads customer ID"`
+	CampaignID         string  `json:"campaign_id,omitempty" jsonschema:"Campagne waarvan het dagbudget wijzigt (het budget wordt erbij gezocht)"`
+	BudgetResourceName string  `json:"campaign_budget_resource_name,omitempty" jsonschema:"Alternatief: volledige budget-resourceName"`
+	AmountMicros       int64   `json:"amount_micros,omitempty" jsonschema:"Nieuw dagbudget in micros"`
+	Amount             float64 `json:"amount,omitempty" jsonschema:"Nieuw dagbudget in euro's (bv. 15.00)"`
+	ValidateOnly       bool    `json:"validate_only,omitempty" jsonschema:"true = alleen laten valideren, er wijzigt niets"`
+	Confirm            bool    `json:"confirm" jsonschema:"Must be true - dit wijzigt live budgetten"`
+}
+
+func registerAdsBudget(server *mcp.Server) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ads_set_campaign_budget",
+		Description: "Wijzig het dagbudget van een campagne (vereist confirm: true)",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input AdsBudgetInput) (*mcp.CallToolResult, api.ActionResponse, error) {
+		params := map[string]any{
+			"campaign_id":   input.CampaignID,
+			"validate_only": input.ValidateOnly,
+		}
+		if input.BudgetResourceName != "" {
+			params["budget_resource_name"] = input.BudgetResourceName
+		}
+		if input.AmountMicros > 0 {
+			params["amount_micros"] = input.AmountMicros
+		}
+		if input.Amount > 0 {
+			params["amount"] = input.Amount
+		}
+		out, err := runAdsWrite(ctx, input.Confirm, input.CustomerID, "set_campaign_budget", params,
+			"een budgetwijziging beïnvloedt direct de besteding")
+		if err != nil {
+			return nil, api.ActionResponse{}, err
+		}
+		return nil, out, nil
+	})
+}
+
+type AdsConversionActionInput struct {
+	CustomerID                 string `json:"customer_id" jsonschema:"Google Ads customer ID"`
+	ConversionActionID         string `json:"conversion_action_id" jsonschema:"Conversieactie-id (bv. 7835486623)"`
+	PrimaryForGoal             *bool  `json:"primary_for_goal,omitempty" jsonschema:"true = primaire conversie voor de accountdoelen"`
+	IncludeInConversionsMetric *bool  `json:"include_in_conversions_metric,omitempty" jsonschema:"true = meetellen in de kolom Conversies"`
+	Status                     string `json:"status,omitempty" jsonschema:"ENABLED of HIDDEN"`
+	ValidateOnly               bool   `json:"validate_only,omitempty" jsonschema:"true = alleen laten valideren, er wijzigt niets"`
+	Confirm                    bool   `json:"confirm" jsonschema:"Must be true - dit wijzigt live conversiemeting"`
+}
+
+func registerAdsConversionAction(server *mcp.Server) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ads_conversion_action_update",
+		Description: "Wijzig een conversieactie: primair doel, meetellen in Conversies, of ENABLED/HIDDEN (vereist confirm: true; validate_only eerst)",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input AdsConversionActionInput) (*mcp.CallToolResult, api.ActionResponse, error) {
+		params := map[string]any{
+			"conversion_action_id": input.ConversionActionID,
+			"status":               input.Status,
+			"validate_only":        input.ValidateOnly,
+		}
+		if input.PrimaryForGoal != nil {
+			params["primary_for_goal"] = *input.PrimaryForGoal
+		}
+		if input.IncludeInConversionsMetric != nil {
+			params["include_in_conversions_metric"] = *input.IncludeInConversionsMetric
+		}
+		out, err := runAdsWrite(ctx, input.Confirm, input.CustomerID, "set_conversion_action", params,
+			"dit verandert hoe conversies geteld en geboden worden")
 		if err != nil {
 			return nil, api.ActionResponse{}, err
 		}

@@ -66,7 +66,7 @@ func main() {
 	}, nil)
 	server.AddReceivingMiddleware(middleware.NewLoggingMiddleware(logger))
 	registerTools(server)
-	logger.Info("registered tools", "tools", 7, "connectors", api.SupportedConnectors)
+	logger.Info("registered tools", "tools", 16, "connectors", api.SupportedConnectors)
 
 	switch transport := transportFromArgs(os.Args[1:], cfg.Transport); transport {
 	case "stdio":

@@ -1,8 +1,8 @@
 # analytics-mcp
 
 Self-hosted MCP + JSON API server for three Google APIs: Analytics Data (GA4),
-Search Console and Google Ads (including campaign pause/enable, negative
-keywords and budget writes).
+Search Console and Google Ads (reads plus targeted writes: campaigns, ad groups,
+ads, keywords, budgets, conversion actions and account conversion goals).
 
 ## Connectors and accounts
 
@@ -13,20 +13,29 @@ keywords and budget writes).
 | `google_ads` | Google Ads customer id | `campaign_name`, `spend`, `clicks`, `conversions`, `search_term` |
 | `google_ads` + `options.keyword_seeds` | customer id | Keyword Planner ideas: volume, competition, top-of-page bids |
 
+Ads fields are flat names mapped to GAQL; a dotted GAQL path (`conversion_action.status`) also
+works and is passed through with its resource as the FROM clause.
+
 ## HTTP API (dashboards)
 
 POST /query  {connector, account, fields[], date_from, date_to, group_by[], limit}
              -> {status:"done", data:[...], total_rows:N}
 POST /action {connector, account, action, params{}}
-             actions: pause_campaign, enable_campaign, push_negative_keywords,
-                      set_campaign_budget
+             actions: pause_campaign, enable_campaign, push_negative_keywords, set_campaign_budget,
+                      create_campaign, create_ad_group, mutate, add_keywords, set_keyword_status,
+                      remove_keyword, set_ad_group_status, set_ad_status, set_conversion_action
 
-Both require `Authorization: Bearer <token>` from the OAuth flow at /authorize.
+Writes accept `validate_only: true` (Google checks the mutation without applying it) and
+`partial_failure: true`; campaigns and ad groups can be paused but not removed.
+
+Both require `Authorization: Bearer *** from the OAuth flow at /authorize.
 
 ## MCP tools
 
 ping, auth_status, ga4_report, gsc_query, ads_search, ads_keyword_ideas,
-ads_set_campaign_status (confirm: true), ads_push_negative_keywords (confirm: true).
+ads_set_campaign_status, ads_push_negative_keywords, ads_mutate, ads_add_keywords,
+ads_set_keyword_status, ads_remove_keyword, ads_set_ad_group_status, ads_set_ad_status,
+ads_set_campaign_budget, ads_conversion_action_update — every write requires `confirm: true`.
 
 Get started: call `auth_status`; if it reports `authenticated: false`, open
 /authorize in a browser and link a Google account that can see the GA4 property,
